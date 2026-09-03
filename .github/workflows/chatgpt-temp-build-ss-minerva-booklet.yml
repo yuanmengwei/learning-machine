@@ -1,0 +1,172 @@
+name: ChatGPT temporary build SS Minerva complete booklet
+
+on:
+  push:
+    branches:
+      - chatgpt-temp-ss-minerva-complete-pdf-20260903
+
+permissions:
+  contents: read
+
+jobs:
+  build-booklet:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install PDF tooling
+        run: python -m pip install --quiet requests pillow img2pdf pypdf
+
+      - name: Download original drawing sheets and build one PDF
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build_booklet.py <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import sys
+          import time
+          from pathlib import Path
+          from urllib.parse import quote
+
+          import img2pdf
+          import requests
+          from PIL import Image
+
+          ITEM = "yn453ga1929"
+          OUTDIR = Path("drawing_sheets")
+          OUTDIR.mkdir(exist_ok=True)
+          session = requests.Session()
+          session.headers.update({"User-Agent": "ship-drawing-test-booklet/1.0"})
+
+          def get(url: str, *, stream: bool = False):
+              last = None
+              for attempt in range(6):
+                  try:
+                      r = session.get(url, timeout=90, stream=stream)
+                      r.raise_for_status()
+                      return r
+                  except Exception as exc:
+                      last = exc
+                      time.sleep(min(2 ** attempt, 15))
+              raise RuntimeError(f"Failed after retries: {url}: {last}")
+
+          metadata_url = f"https://archive.org/metadata/{ITEM}"
+          metadata = get(metadata_url).json()
+          Path("source_metadata.json").write_text(
+              json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+
+          files = metadata.get("files", [])
+          pattern = re.compile(r"^(\d{1,2})\s*-\s*.+\.(?:jpe?g|png)$", re.I)
+          selected = []
+          for entry in files:
+              name = entry.get("name", "")
+              m = pattern.match(name)
+              if not m:
+                  continue
+              if name.startswith("__") or "thumb" in name.lower():
+                  continue
+              selected.append((int(m.group(1)), name, entry))
+
+          # If the item metadata marks multiple derivatives with the same numbered title,
+          # prefer the exact human-readable .jpg sheet names and de-duplicate by number/name.
+          selected.sort(key=lambda x: (x[0], x[1].lower()))
+          deduped = []
+          seen_names = set()
+          for number, name, entry in selected:
+              key = name.lower()
+              if key in seen_names:
+                  continue
+              seen_names.add(key)
+              deduped.append((number, name, entry))
+          selected = deduped
+
+          if len(selected) < 4:
+              available = "\n".join(sorted(e.get("name", "") for e in files))
+              print("Available files:\n" + available)
+              raise RuntimeError(f"Expected at least 4 numbered drawing sheets, found {len(selected)}")
+
+          manifest = {
+              "source": f"https://archive.org/details/{ITEM}",
+              "identifier": ITEM,
+              "title": metadata.get("metadata", {}).get("title"),
+              "drawing_count": len(selected),
+              "drawings": [],
+          }
+          local_paths = []
+          for index, (number, name, entry) in enumerate(selected, start=1):
+              suffix = Path(name).suffix.lower()
+              local = OUTDIR / f"{index:02d}_{number:02d}{suffix}"
+              url = f"https://archive.org/download/{ITEM}/{quote(name, safe='')}"
+              response = get(url, stream=True)
+              sha = hashlib.sha256()
+              size = 0
+              with local.open("wb") as fh:
+                  for chunk in response.iter_content(chunk_size=1024 * 1024):
+                      if chunk:
+                          fh.write(chunk)
+                          sha.update(chunk)
+                          size += len(chunk)
+              if size == 0:
+                  raise RuntimeError(f"Empty download: {name}")
+              with Image.open(local) as image:
+                  image.verify()
+              with Image.open(local) as image:
+                  width, height = image.size
+              local_paths.append(str(local))
+              manifest["drawings"].append({
+                  "order": index,
+                  "number": number,
+                  "original_name": name,
+                  "download_url": url,
+                  "bytes": size,
+                  "width_px": width,
+                  "height_px": height,
+                  "sha256": sha.hexdigest(),
+                  "format": entry.get("format"),
+                  "source": entry.get("source"),
+              })
+              print(f"{index:02d}: {name} -> {local} ({width}x{height}, {size} bytes)")
+
+          Path("SS_Minerva_complete_drawing_manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+
+          # Losslessly embed JPEGs and place each sheet at 300-DPI physical scale.
+          layout = img2pdf.get_fixed_dpi_layout_fun((300, 300))
+          pdf_bytes = img2pdf.convert(local_paths, layout_fun=layout)
+          out_pdf = Path("SS_Minerva_Complete_General_Arrangement_Drawings.pdf")
+          out_pdf.write_bytes(pdf_bytes)
+          if out_pdf.stat().st_size < 100_000:
+              raise RuntimeError("Generated PDF is unexpectedly small")
+          print(f"Created {out_pdf} with {len(local_paths)} pages, {out_pdf.stat().st_size} bytes")
+          PY
+          python build_booklet.py
+
+      - name: Inspect generated PDF
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pypdf import PdfReader
+          p = "SS_Minerva_Complete_General_Arrangement_Drawings.pdf"
+          reader = PdfReader(p)
+          print("pages=", len(reader.pages))
+          assert len(reader.pages) >= 4
+          for i, page in enumerate(reader.pages, 1):
+              box = page.mediabox
+              print(i, float(box.width), float(box.height))
+          PY
+          sha256sum SS_Minerva_Complete_General_Arrangement_Drawings.pdf
+          ls -lh SS_Minerva_Complete_General_Arrangement_Drawings.pdf
+
+      - name: Upload complete drawing booklet
+        uses: actions/upload-artifact@v4
+        with:
+          name: ss-minerva-complete-general-arrangement-drawings
+          path: |
+            SS_Minerva_Complete_General_Arrangement_Drawings.pdf
+            SS_Minerva_complete_drawing_manifest.json
+          if-no-files-found: error
+          retention-days: 1
